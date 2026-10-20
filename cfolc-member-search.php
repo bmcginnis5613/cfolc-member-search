@@ -2,7 +2,8 @@
 /**
  * Plugin Name: CFOLC Member Search
  * Description: Search, filter and export member data by various attributes.
- * Version: 1.0.0
+ * Version: 1.0.1
+ * Requires PHP: 7.4
  * Author: FirstTracks Marketing
  * Author URI: https://firsttracksmarketing.com
  */
@@ -3781,42 +3782,31 @@ function cen_ear_is_phpspreadsheet_namespace_loaded() {
 }
 
 /**
- * Load PhpSpreadsheet from an active provider or a bundled Composer autoloader.
+ * Load this plugin's bundled copy of PhpSpreadsheet.
  *
  * @param string[] $required_classes Required class names.
  * @return true|WP_Error
  */
 function cen_ear_load_phpspreadsheet_library( $required_classes ) {
-	if ( cen_ear_phpspreadsheet_classes_available( $required_classes ) ) {
-		return true;
-	}
+	$autoload_path = plugin_dir_path( __FILE__ ) . 'vendor/autoload.php';
 
-	if ( cen_ear_is_phpspreadsheet_namespace_loaded() ) {
+	if ( ! file_exists( $autoload_path ) ) {
 		return new WP_Error(
-			'phpspreadsheet_conflict',
-			__( 'Another plugin has loaded an incompatible copy of PhpSpreadsheet. Please update or temporarily disable the conflicting plugin before exporting Excel files.', 'member-search' )
+			'missing_phpspreadsheet',
+			__( 'The bundled PhpSpreadsheet library is missing. Reinstall the CFOLC Member Search plugin.', 'member-search' )
 		);
 	}
 
-	$autoload_paths = apply_filters(
-		'cen_ear_phpspreadsheet_autoload_paths',
-		array(
-			plugin_dir_path( __FILE__ ) . 'vendor/autoload.php',
-			plugin_dir_path( __FILE__ ) . '_inc/vendor/autoload.php',
-		)
-	);
-
-	foreach ( (array) $autoload_paths as $autoload_path ) {
-		if ( is_string( $autoload_path ) && file_exists( $autoload_path ) ) {
-			require_once $autoload_path;
-			break;
-		}
-	}
+	require_once $autoload_path;
 
 	if ( ! cen_ear_phpspreadsheet_classes_available( $required_classes ) ) {
+		$message = cen_ear_is_phpspreadsheet_namespace_loaded()
+			? __( 'Another plugin has already loaded an incompatible copy of PhpSpreadsheet. Please update or temporarily disable the conflicting plugin before exporting Excel files.', 'member-search' )
+			: __( 'The bundled PhpSpreadsheet library could not be loaded. Reinstall the CFOLC Member Search plugin.', 'member-search' );
+
 		return new WP_Error(
-			'missing_phpspreadsheet',
-			__( 'PhpSpreadsheet is not available. Ensure the Excel import/export provider is active or install this plugin\'s Composer dependencies.', 'member-search' )
+			'phpspreadsheet_load_failed',
+			$message
 		);
 	}
 
