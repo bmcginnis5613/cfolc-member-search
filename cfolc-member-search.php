@@ -2,7 +2,7 @@
 /**
  * Plugin Name: CFOLC Member Search
  * Description: Search, filter and export member data by various attributes.
- * Version: 1.0.1
+ * Version: 1.0.2
  * Requires PHP: 7.4
  * Author: FirstTracks Marketing
  * Author URI: https://firsttracksmarketing.com
@@ -871,6 +871,8 @@ function cen_ear_get_attendance_report_rows( $event_id, $include_suspended = fal
 
 		$is_rsvp         = cen_ear_is_rsvp_attendee( $attendee );
 		$attendee_status = cen_ear_get_attendee_meta_value( $attendee, array( 'Attendee Status', 'attendee_status', 'status' ) );
+		$attendee_id     = isset( $attendee['attendee_id'] ) ? absint( $attendee['attendee_id'] ) : 0;
+		$rsvp_date       = $attendee_id ? get_post_time( 'n/j/Y g:i A', false, $attendee_id, true ) : '';
 		if ( $is_rsvp ) {
 			$attendee_status = $user_id ? cen_ear_get_buddyboss_profile_types( $user_id ) : '';
 		}
@@ -884,6 +886,7 @@ function cen_ear_get_attendance_report_rows( $event_id, $include_suspended = fal
 			'attendee_status' => $attendee_status,
 			'invited_by'      => $is_rsvp ? '' : cen_ear_get_attendee_meta_value( $attendee, array( 'Who can we thank for inviting you?', 'who_can_we_thank_for_inviting_you', 'invited_by' ) ),
 			'speaker_question' => $is_rsvp ? '' : cen_ear_get_attendee_meta_value( $attendee, array( 'Do you have a question for the speaker?', 'do_you_have_a_question_for_the_speaker', 'speaker_question' ) ),
+			'rsvp_date'         => $rsvp_date,
 			'event_rsvp_status' => cen_ear_get_attendee_rsvp_status_label( cen_ear_get_attendee_rsvp_status( $attendee ) ),
 			'name'             => $name,
 			'email'            => $email,
@@ -4082,6 +4085,7 @@ function cen_ear_stream_member_workbook( $members, $attendance_report = false ) 
 		array( 'header' => 'Do you have a question for the speaker?', 'key' => 'speaker_question', 'width' => 48 ),
 		array( 'header' => 'Who can we thank for inviting you?', 'key' => 'invited_by', 'width' => 38 ),
 		array( 'header' => 'CPE Option', 'key' => 'cpe_option', 'width' => 22 ),
+		array( 'header' => 'RSVP Date', 'key' => 'rsvp_date', 'width' => 22, 'format' => 'datetime' ),
 		array( 'header' => 'RSVP Status', 'key' => 'event_rsvp_status', 'width' => 20 ),
 		array( 'header' => 'Phone Number', 'key' => 'phone', 'width' => 22, 'format' => 'phone' ),
 	) : array(
