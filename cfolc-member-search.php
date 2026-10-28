@@ -2,7 +2,7 @@
 /**
  * Plugin Name: CFOLC Member Search
  * Description: Search, filter and export member data by various attributes.
- * Version: 1.0.2
+ * Version: 1.0.3
  * Requires PHP: 7.4
  * Author: FirstTracks Marketing
  * Author URI: https://firsttracksmarketing.com
@@ -93,6 +93,7 @@ function cen_ear_get_preview_columns( $include_event_rsvp_status = true ) {
 	$columns['completed_onboarding']        = array( 'label' => 'Completed Onboarding', 'type' => 'text' );
 	$columns['bb_profile_type']              = array( 'label' => 'BB Profile Type', 'type' => 'text' );
 	$columns['bb_status']                    = array( 'label' => 'BB Status', 'type' => 'text' );
+	$columns['forum_discussion_emails']      = array( 'label' => 'Forum Discussion Emails', 'type' => 'text' );
 	if ( $include_event_rsvp_status ) {
 		$columns['event_rsvp_status'] = array( 'label' => 'RSVP Status', 'type' => 'list' );
 	}
@@ -108,7 +109,7 @@ function cen_ear_get_preview_columns( $include_event_rsvp_status = true ) {
 function cen_ear_get_default_preview_fields() {
 	return (array) apply_filters(
 		'cen_ear_default_preview_fields',
-		array( 'wp_user_id', 'first_name', 'last_name', 'title', 'company', 'email', 'phone', 'bb_groups', 'last_active', 'completed_onboarding', 'bb_status', 'event_rsvp_status' )
+		array( 'wp_user_id', 'first_name', 'last_name', 'title', 'company', 'email', 'phone', 'bb_groups', 'last_active', 'completed_onboarding', 'bb_status', 'forum_discussion_emails', 'event_rsvp_status' )
 	);
 }
 
@@ -1165,6 +1166,21 @@ function cen_ear_get_search_attributes( $event_choices ) {
 		'operators'      => array( 'is' => __( 'Is', 'member-search' ) ),
 		'available'      => class_exists( 'GFForms' ) || class_exists( 'GFAPI' ),
 	);
+	$attributes['forum_discussion_emails'] = array(
+		'label'          => 'Forum Discussion Emails',
+		'type'           => 'single_choice',
+		'criterion_type' => 'attribute',
+		'query_type'     => 'buddyboss_forum_discussion_emails',
+		'choices'        => array(
+			'subscribed'   => __( 'Subscribed', 'member-search' ),
+			'unsubscribed' => __( 'Unsubscribed', 'member-search' ),
+		),
+		'operators'      => array(
+			'is'     => __( 'Is', 'member-search' ),
+			'is_not' => __( 'Is not', 'member-search' ),
+		),
+		'available'      => true,
+	);
 
 	$membership_plan_choices = cen_ear_get_woocommerce_membership_plan_choices();
 	$attributes['membership_plan'] = array(
@@ -1724,6 +1740,32 @@ function cen_ear_get_buddyboss_status_match_ids( $comparison, $values = array() 
 }
 
 /**
+ * Return user IDs whose forum-discussion email preference matches a selected
+ * status. An unset BuddyBoss preference is treated as subscribed.
+ *
+ * @param string[] $values Selected statuses.
+ * @return int[]
+ */
+function cen_ear_get_forum_discussion_email_match_ids( $values = array() ) {
+	$user_ids = array_values( array_filter( array_map( 'absint', get_users( array( 'fields' => 'ID' ) ) ) ) );
+	$values   = array_values( array_filter( array_map( 'sanitize_key', (array) $values ) ) );
+	if ( function_exists( 'update_meta_cache' ) ) {
+		update_meta_cache( 'user', $user_ids );
+	}
+
+	return array_values(
+		array_filter(
+			$user_ids,
+			static function ( $user_id ) use ( $values ) {
+				$status = sanitize_key( cen_ear_get_forum_discussion_email_status( $user_id ) );
+
+				return in_array( $status, $values, true );
+			}
+		)
+	);
+}
+
+/**
  * Return user IDs assigned to any selected BuddyBoss profile type.
  *
  * @param string   $comparison Supported comparison: exact or nonempty.
@@ -1838,11 +1880,13 @@ function cen_ear_query_criteria_rules( $rules, $attributes, $page = 1, $include_
 			}
 			continue;
 		}
-		if ( in_array( $query_type, array( 'buddyboss_status', 'buddyboss_profile_type', 'buddyboss_group' ), true ) ) {
+		if ( in_array( $query_type, array( 'buddyboss_status', 'buddyboss_forum_discussion_emails', 'buddyboss_profile_type', 'buddyboss_group' ), true ) ) {
 			$is_positive = in_array( $rule['operator'], array( 'is', 'is_not_empty' ), true );
 			$comparison  = in_array( $rule['operator'], array( 'is', 'is_not' ), true ) ? 'exact' : 'nonempty';
 			if ( 'buddyboss_status' === $query_type ) {
 				$matching_ids = cen_ear_get_buddyboss_status_match_ids( $comparison, $rule['values'] );
+			} elseif ( 'buddyboss_forum_discussion_emails' === $query_type ) {
+				$matching_ids = cen_ear_get_forum_discussion_email_match_ids( $rule['values'] );
 			} elseif ( 'buddyboss_profile_type' === $query_type ) {
 				$matching_ids = cen_ear_get_buddyboss_profile_type_match_ids( $comparison, $rule['values'] );
 			} else {
@@ -3153,6 +3197,29 @@ function cen_ear_get_user_meta_text( $user_id, $key ) {
 }
 
 /**
+ * Return the user's BuddyBoss email preference for new discussions in
+ * subscribed forums.
+ *
+ * Modern BuddyBoss versions store this preference under the registered
+ * bb_forums_subscribed_discussion notification type. Use BuddyBoss's own
+ * resolver so user, site-wide, and default settings are all respected. The
+ * legacy user-meta key remains as a compatibility fallback.
+ *
+ * @param int $user_id WordPress user ID.
+ * @return string
+ */
+function cen_ear_get_forum_discussion_email_status( $user_id ) {
+	$user_id = absint( $user_id );
+	if ( function_exists( 'bb_is_notification_enabled' ) ) {
+		return bb_is_notification_enabled( $user_id, 'bb_forums_subscribed_discussion', 'email' ) ? 'Subscribed' : 'Unsubscribed';
+	}
+
+	$preference = get_user_meta( $user_id, 'notification_forums_following_topic', true );
+
+	return 'no' === strtolower( trim( (string) $preference ) ) ? 'Unsubscribed' : 'Subscribed';
+}
+
+/**
  * Check every BuddyBoss state that makes a member profile inactive.
  *
  * BuddyBoss moderation suspensions and BuddyPress spammer flags are stored and
@@ -3709,6 +3776,7 @@ function cen_ear_get_member_report_rows( $user_ids, $include_export_fields = fal
 			'wp_user_id' => (string) $user_id,
 			'bb_status'  => cen_ear_get_buddyboss_status( $user_id ),
 			'bb_groups'  => isset( $groups_by_user[ $user_id ] ) ? $groups_by_user[ $user_id ] : '',
+			'forum_discussion_emails' => cen_ear_get_forum_discussion_email_status( $user_id ),
 		);
 		if ( ! empty( $event_ids ) ) {
 			$row['event_rsvp_status'] = isset( $event_statuses[ $user_id ] ) ? implode( '||', $event_statuses[ $user_id ] ) : '';
@@ -4119,6 +4187,7 @@ function cen_ear_stream_member_workbook( $members, $attendance_report = false ) 
 			array( 'header' => 'Completed Onboarding', 'key' => 'completed_onboarding', 'width' => 22 ),
 			array( 'header' => 'BB Profile Type', 'key' => 'bb_profile_type', 'width' => 24 ),
 			array( 'header' => 'BB Status', 'key' => 'bb_status', 'width' => 14 ),
+			array( 'header' => 'Forum Discussion Emails', 'key' => 'forum_discussion_emails', 'width' => 26 ),
 		)
 		);
 	}
