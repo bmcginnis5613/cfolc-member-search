@@ -2,7 +2,7 @@
 /**
  * Plugin Name: CFOLC Member Search
  * Description: Search, filter and export member data by various attributes.
- * Version: 1.1.9
+ * Version: 1.1.10
  * Requires PHP: 7.4
  * Author: FirstTracks Marketing
  * Author URI: https://firsttracksmarketing.com
@@ -3140,7 +3140,7 @@ function cen_ear_render_member_search_page() {
 						<?php wp_nonce_field( 'cen_ear_add_report_schedule' ); ?>
 						<p><label><?php echo esc_html__( 'Report name', 'member-search' ); ?><br><input type="text" name="report_name" class="regular-text" value="" autocomplete="off" data-1p-ignore data-lpignore="true" data-bwignore="true" required></label></p>
 						<p><label><?php echo esc_html__( 'Email report to', 'member-search' ); ?><br><input type="email" name="report_email" class="regular-text" value="" autocomplete="off" data-1p-ignore data-lpignore="true" data-bwignore="true" data-form-type="other" multiple required></label><br><span class="description"><?php echo esc_html__( 'Separate multiple email addresses with commas.', 'member-search' ); ?></span></p>
-						<p><strong><?php echo esc_html__( 'Runs:', 'member-search' ); ?></strong> <?php echo esc_html__( 'At 11:59 PM on the final day of every month (in the timezone of the WordPress site).', 'member-search' ); ?></p>
+						<p><strong><?php echo esc_html__( 'Runs:', 'member-search' ); ?></strong> <?php echo esc_html( sprintf( __( 'At 11:59 PM on the final day of every month (%s).', 'member-search' ), wp_timezone()->getName() ) ); ?></p>
 						<p><button type="submit" class="button button-primary"><?php echo esc_html__( 'Save Automatic Report', 'member-search' ); ?></button></p>
 					</form>
 				</details>
