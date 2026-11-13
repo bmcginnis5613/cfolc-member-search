@@ -2,7 +2,7 @@
 /**
  * Plugin Name: CFOLC Member Search
  * Description: Search, filter and export member data by various attributes.
- * Version: 1.1.10
+ * Version: 1.1.11
  * Requires PHP: 7.4
  * Author: FirstTracks Marketing
  * Author URI: https://firsttracksmarketing.com
@@ -156,6 +156,19 @@ function cen_ear_get_next_report_run( $after_timestamp = 0 ) {
 	}
 
 	return $next->getTimestamp();
+}
+
+/**
+ * Determine whether automatic report delivery must be suppressed.
+ *
+ * @return bool
+ */
+function cen_ear_is_staging_environment() {
+	$environment = function_exists( 'wp_get_environment_type' )
+		? wp_get_environment_type()
+		: ( defined( 'WP_ENVIRONMENT_TYPE' ) ? WP_ENVIRONMENT_TYPE : 'production' );
+
+	return (bool) apply_filters( 'cen_ear_is_staging_environment', 'staging' === $environment, $environment );
 }
 
 /**
@@ -4668,6 +4681,14 @@ function cen_ear_export_members() {
 function cen_ear_run_scheduled_report( $schedule_id ) {
 	$schedules = cen_ear_get_report_schedules();
 	if ( empty( $schedules[ $schedule_id ] ) ) {
+		return;
+	}
+	if ( cen_ear_is_staging_environment() ) {
+		$schedules[ $schedule_id ]['last_run']    = time();
+		$schedules[ $schedule_id ]['last_status'] = 'skipped_staging';
+		update_option( CEN_EAR_REPORT_SCHEDULES_OPTION, $schedules, false );
+		cen_ear_schedule_next_report_run( $schedule_id, time() );
+
 		return;
 	}
 
