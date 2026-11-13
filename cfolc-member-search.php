@@ -2,7 +2,7 @@
 /**
  * Plugin Name: CFOLC Member Search
  * Description: Search, filter and export member data by various attributes.
- * Version: 1.0.3
+ * Version: 1.1.9
  * Requires PHP: 7.4
  * Author: FirstTracks Marketing
  * Author URI: https://firsttracksmarketing.com
@@ -34,6 +34,11 @@ function cen_ear_register_member_search_page() {
 }
 add_action( 'admin_menu', 'cen_ear_register_member_search_page', 20 );
 add_action( 'admin_post_cen_ear_export_members', 'cen_ear_export_members' );
+add_action( 'admin_post_cen_ear_add_report_schedule', 'cen_ear_add_report_schedule' );
+add_action( 'admin_post_cen_ear_delete_report_schedule', 'cen_ear_delete_report_schedule' );
+add_action( 'cen_ear_run_scheduled_report', 'cen_ear_run_scheduled_report' );
+
+define( 'CEN_EAR_REPORT_SCHEDULES_OPTION', 'cen_ear_report_schedules' );
 
 /**
  * Return the capability required to search and export members.
@@ -56,6 +61,184 @@ function cen_ear_get_admin_page_url( $args = array() ) {
 	$url = admin_url( 'users.php?page=member-search' );
 
 	return empty( $args ) ? $url : add_query_arg( $args, $url );
+}
+
+/**
+ * Return all saved automatic report schedules.
+ *
+ * @return array<string,array<string,mixed>>
+ */
+function cen_ear_get_report_schedules() {
+	$schedules = get_option( CEN_EAR_REPORT_SCHEDULES_OPTION, array() );
+
+	return is_array( $schedules ) ? $schedules : array();
+}
+
+/**
+ * Parse and validate one or more comma-separated report recipients.
+ *
+ * @param string|array $value Submitted or saved recipient value.
+ * @return string[]
+ */
+function cen_ear_get_report_recipient_emails( $value ) {
+	$submitted = is_array( $value ) ? $value : preg_split( '/\s*,\s*/', (string) $value );
+	$emails    = array();
+
+	foreach ( (array) $submitted as $email ) {
+		$email = sanitize_email( trim( (string) $email ) );
+		if ( '' !== $email && is_email( $email ) ) {
+			$emails[] = strtolower( $email );
+		}
+	}
+
+	return array_values( array_unique( $emails ) );
+}
+
+/**
+ * Turn saved criteria into concise, human-readable descriptions.
+ *
+ * @param array<int,array<string,mixed>> $rules      Saved criteria rules.
+ * @param array<string,array<string,mixed>> $attributes Registered search attributes.
+ * @return string[]
+ */
+function cen_ear_get_report_criteria_summary( $rules, $attributes ) {
+	$summary = array();
+
+	foreach ( (array) $rules as $rule ) {
+		$attribute_key = isset( $rule['attribute'] ) ? sanitize_key( $rule['attribute'] ) : '';
+		$operator_key  = isset( $rule['operator'] ) ? sanitize_key( $rule['operator'] ) : '';
+		if ( '' === $attribute_key || ! isset( $attributes[ $attribute_key ] ) ) {
+			continue;
+		}
+
+		$attribute     = $attributes[ $attribute_key ];
+		$attribute_label = isset( $attribute['label'] ) ? (string) $attribute['label'] : $attribute_key;
+		$operator_label  = isset( $attribute['operators'][ $operator_key ] ) ? (string) $attribute['operators'][ $operator_key ] : $operator_key;
+		$value_labels    = array();
+
+		foreach ( isset( $rule['values'] ) ? (array) $rule['values'] : array() as $value ) {
+			$value = (string) $value;
+			if ( isset( $attribute['choices'] ) && is_array( $attribute['choices'] ) && array_key_exists( $value, $attribute['choices'] ) ) {
+				$value_labels[] = (string) $attribute['choices'][ $value ];
+			} else {
+				$value_labels[] = $value;
+			}
+		}
+
+		$description = $attribute_label;
+		if ( '' !== $operator_label ) {
+			$description .= ' — ' . $operator_label;
+		}
+		if ( ! empty( $value_labels ) ) {
+			$description .= ': ' . implode( ' ' . __( 'or', 'member-search' ) . ' ', $value_labels );
+		}
+		$summary[] = $description;
+	}
+
+	return $summary;
+}
+
+/**
+ * Calculate 11:59 PM on the next applicable final day of a month.
+ *
+ * @param int $after_timestamp Find a run after this Unix timestamp.
+ * @return int
+ */
+function cen_ear_get_next_report_run( $after_timestamp = 0 ) {
+	$timezone = wp_timezone();
+	$after    = $after_timestamp > 0
+		? ( new DateTimeImmutable( '@' . $after_timestamp ) )->setTimezone( $timezone )
+		: new DateTimeImmutable( 'now', $timezone );
+	$next     = $after->modify( 'last day of this month' )->setTime( 23, 59, 0 );
+
+	if ( $next->getTimestamp() <= $after->getTimestamp() ) {
+		$next = $after->modify( 'last day of next month' )->setTime( 23, 59, 0 );
+	}
+
+	return $next->getTimestamp();
+}
+
+/**
+ * Ensure a saved report has one future WordPress cron event.
+ *
+ * @param string $schedule_id Schedule identifier.
+ * @param int    $after_timestamp Base time for the next run.
+ * @return int|false
+ */
+function cen_ear_schedule_next_report_run( $schedule_id, $after_timestamp = 0 ) {
+	$args = array( $schedule_id );
+	$next = wp_next_scheduled( 'cen_ear_run_scheduled_report', $args );
+	if ( $next ) {
+		return $next;
+	}
+
+	$timestamp = cen_ear_get_next_report_run( $after_timestamp );
+
+	return wp_schedule_single_event( $timestamp, 'cen_ear_run_scheduled_report', $args ) ? $timestamp : false;
+}
+
+/**
+ * Save the current criteria as an automatic report.
+ */
+function cen_ear_add_report_schedule() {
+	if ( ! current_user_can( cen_ear_get_required_capability() ) ) {
+		wp_die( esc_html__( 'You are not allowed to schedule member reports.', 'member-search' ), '', array( 'response' => 403 ) );
+	}
+
+	check_admin_referer( 'cen_ear_add_report_schedule' );
+
+	$attributes = cen_ear_get_search_attributes( cen_ear_get_event_choices() );
+	$rules      = cen_ear_validate_criteria_rules( cen_ear_get_criteria_rules( $_POST ), $attributes );
+	$email_input = isset( $_POST['report_email'] ) ? wp_unslash( $_POST['report_email'] ) : '';
+	$emails      = cen_ear_get_report_recipient_emails( $email_input );
+	$name       = isset( $_POST['report_name'] ) ? sanitize_text_field( wp_unslash( $_POST['report_name'] ) ) : '';
+
+	$submitted_email_count = count( array_filter( preg_split( '/\s*,\s*/', (string) $email_input ) ) );
+	if ( is_wp_error( $rules ) || empty( $emails ) || count( $emails ) !== $submitted_email_count ) {
+		wp_safe_redirect( cen_ear_get_admin_page_url( array( 'schedule_status' => 'invalid' ) ) );
+		exit;
+	}
+
+	$schedule_id = function_exists( 'wp_generate_uuid4' ) ? wp_generate_uuid4() : uniqid( 'cen-ear-', true );
+	$schedules   = cen_ear_get_report_schedules();
+	$schedules[ $schedule_id ] = array(
+		'id'                => $schedule_id,
+		'name'              => '' !== $name ? $name : __( 'Automatic Member Report', 'member-search' ),
+		'email'             => $emails,
+		'rules'             => $rules,
+		'include_suspended' => isset( $_POST['include_suspended'] ) && '1' === sanitize_text_field( wp_unslash( $_POST['include_suspended'] ) ),
+		'created_by'        => get_current_user_id(),
+		'created_at'        => time(),
+		'last_run'          => 0,
+		'last_status'       => '',
+	);
+	update_option( CEN_EAR_REPORT_SCHEDULES_OPTION, $schedules, false );
+
+	$scheduled = cen_ear_schedule_next_report_run( $schedule_id );
+	wp_safe_redirect( cen_ear_get_admin_page_url( array( 'schedule_status' => $scheduled ? 'added' : 'cron_error' ) ) );
+	exit;
+}
+
+/**
+ * Delete an automatic report schedule and its pending cron event.
+ */
+function cen_ear_delete_report_schedule() {
+	if ( ! current_user_can( cen_ear_get_required_capability() ) ) {
+		wp_die( esc_html__( 'You are not allowed to manage member reports.', 'member-search' ), '', array( 'response' => 403 ) );
+	}
+
+	$schedule_id = isset( $_POST['schedule_id'] ) ? sanitize_text_field( wp_unslash( $_POST['schedule_id'] ) ) : '';
+	check_admin_referer( 'cen_ear_delete_report_schedule_' . $schedule_id );
+	$schedules = cen_ear_get_report_schedules();
+
+	if ( isset( $schedules[ $schedule_id ] ) ) {
+		unset( $schedules[ $schedule_id ] );
+		update_option( CEN_EAR_REPORT_SCHEDULES_OPTION, $schedules, false );
+		wp_clear_scheduled_hook( 'cen_ear_run_scheduled_report', array( $schedule_id ) );
+	}
+
+	wp_safe_redirect( cen_ear_get_admin_page_url( array( 'schedule_status' => 'deleted' ) ) );
+	exit;
 }
 
 /**
@@ -2235,7 +2418,9 @@ function cen_ear_render_criteria_builder( $attributes, $rules, $include_suspende
 			function markResultsStale() {
 				if (initializing) { return; }
 				var exportForm = document.getElementById('cen-ear-export-form');
+				var scheduleEditor = document.getElementById('cen-ear-schedule-editor');
 				if (exportForm) { exportForm.hidden = true; }
+				if (scheduleEditor) { scheduleEditor.hidden = true; }
 			}
 			if (includeSuspended) { includeSuspended.addEventListener('change', markResultsStale); }
 
@@ -2759,6 +2944,7 @@ function cen_ear_render_member_search_page() {
 	$event_choices = cen_ear_get_event_choices();
 	$attributes   = cen_ear_get_search_attributes( $event_choices );
 	$rules        = cen_ear_get_criteria_rules( $_GET ); // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+	$has_submitted_search = isset( $_GET['cen_ear_search'] ) && '1' === sanitize_text_field( wp_unslash( $_GET['cen_ear_search'] ) ); // phpcs:ignore WordPress.Security.NonceVerification.Recommended
 	$current_page = isset( $_GET['results_page'] ) ? max( 1, absint( $_GET['results_page'] ) ) : 1; // phpcs:ignore WordPress.Security.NonceVerification.Recommended
 	$include_suspended = isset( $_GET['include_suspended'] ) && '1' === sanitize_text_field( wp_unslash( $_GET['include_suspended'] ) ); // phpcs:ignore WordPress.Security.NonceVerification.Recommended
 	$search       = null;
@@ -2792,6 +2978,18 @@ function cen_ear_render_member_search_page() {
 	?>
 	<div class="wrap">
 		<h1><?php echo esc_html__( 'Member Search', 'member-search' ); ?></h1>
+		<?php
+		$schedule_status = isset( $_GET['schedule_status'] ) ? sanitize_key( wp_unslash( $_GET['schedule_status'] ) ) : ''; // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+		if ( 'added' === $schedule_status ) {
+			cen_ear_render_notice( __( 'The report was scheduled.', 'member-search' ), 'success' );
+		} elseif ( 'deleted' === $schedule_status ) {
+			cen_ear_render_notice( __( 'The automatic report schedule was deleted.', 'member-search' ), 'success' );
+		} elseif ( 'invalid' === $schedule_status ) {
+			cen_ear_render_notice( __( 'The report could not be scheduled. Check the criteria and recipient email address.', 'member-search' ), 'error' );
+		} elseif ( 'cron_error' === $schedule_status ) {
+			cen_ear_render_notice( __( 'The report was saved, but WordPress could not queue its next run.', 'member-search' ), 'error' );
+		}
+		?>
 
 			<?php if ( $search_error ) : ?>
 				<?php cen_ear_render_notice( $search_error->get_error_message(), 'error' ); ?>
@@ -2870,12 +3068,83 @@ function cen_ear_render_member_search_page() {
 				.cen-ear-pagination .page-numbers a:hover, .cen-ear-pagination .page-numbers a:focus { color: #fff; background: #2271b1; border-color: #2271b1; }
 				.cen-ear-pagination .page-numbers .current { color: #fff; background: #1d2327; border-color: #1d2327; }
 				.cen-ear-pagination .page-numbers .dots { color: #646970; background: transparent; border-color: transparent; }
+				.cen-ear-schedules, .cen-ear-schedule-editor { max-width: 1100px; margin: 18px 0; padding: 14px 16px; background: #fff; border: 1px solid #c3c4c7; }
+				.cen-ear-schedules summary, .cen-ear-schedule-editor summary { color: #1d2327; font-size: 15px; font-weight: 600; cursor: pointer; }
+				.cen-ear-schedules table { margin-top: 14px; }
+				.cen-ear-schedule-criteria { margin: 0; padding-left: 18px; }
+				.cen-ear-schedule-criteria li { margin: 0 0 5px; }
+				.cen-ear-schedule-criteria li:last-child { margin-bottom: 0; }
+				.cen-ear-delete-schedule { color: #fff !important; background: #d63638 !important; border-color: #b32d2e !important; }
+				.cen-ear-delete-schedule:hover, .cen-ear-delete-schedule:focus { color: #fff !important; background: #b32d2e !important; border-color: #8f2424 !important; }
+				.cen-ear-schedule-editor form { margin-top: 14px; }
 				@media (max-width: 782px) { .cen-ear-builder { grid-template-columns: 1fr; } .cen-ear-results-header { align-items: flex-start; flex-direction: column; } .cen-ear-preview-fields-panel { grid-template-columns: 1fr; } }
 			</style>
 
 			<?php cen_ear_render_criteria_builder( $attributes, $rules, $include_suspended ); ?>
 
+			<?php $saved_schedules = cen_ear_get_report_schedules(); ?>
+			<?php if ( ! empty( $saved_schedules ) ) : ?>
+				<details class="cen-ear-schedules">
+					<summary><?php echo esc_html( sprintf( _n( '%s automatic report', '%s automatic reports', count( $saved_schedules ), 'member-search' ), number_format_i18n( count( $saved_schedules ) ) ) ); ?></summary>
+					<table class="widefat striped">
+						<thead><tr><th><?php echo esc_html__( 'Report', 'member-search' ); ?></th><th><?php echo esc_html__( 'Criteria', 'member-search' ); ?></th><th><?php echo esc_html__( 'Recipient', 'member-search' ); ?></th><th><?php echo esc_html__( 'Next run', 'member-search' ); ?></th><th><?php echo esc_html__( 'Last result', 'member-search' ); ?></th><th></th></tr></thead>
+						<tbody>
+						<?php foreach ( $saved_schedules as $saved_schedule_id => $saved_schedule ) : ?>
+							<?php $next_run = wp_next_scheduled( 'cen_ear_run_scheduled_report', array( $saved_schedule_id ) ); ?>
+							<?php $criteria_summary = cen_ear_get_report_criteria_summary( isset( $saved_schedule['rules'] ) ? $saved_schedule['rules'] : array(), $attributes ); ?>
+							<?php if ( empty( $criteria_summary ) ) { $criteria_summary[] = __( 'All members', 'member-search' ); } ?>
+							<?php $criteria_summary[] = ! empty( $saved_schedule['include_suspended'] ) ? __( 'Include suspended profiles', 'member-search' ) : __( 'Active profiles only', 'member-search' ); ?>
+							<tr>
+								<td><?php echo esc_html( isset( $saved_schedule['name'] ) ? $saved_schedule['name'] : __( 'Automatic Member Report', 'member-search' ) ); ?></td>
+								<td>
+									<?php if ( empty( $criteria_summary ) ) : ?>
+										<?php echo esc_html__( 'All members', 'member-search' ); ?>
+									<?php else : ?>
+										<ul class="cen-ear-schedule-criteria">
+											<?php foreach ( $criteria_summary as $criterion_summary ) : ?>
+												<li><?php echo esc_html( $criterion_summary ); ?></li>
+											<?php endforeach; ?>
+										</ul>
+									<?php endif; ?>
+								</td>
+								<td><?php echo esc_html( implode( ', ', cen_ear_get_report_recipient_emails( isset( $saved_schedule['email'] ) ? $saved_schedule['email'] : '' ) ) ); ?></td>
+								<td><?php echo $next_run ? esc_html( wp_date( get_option( 'date_format' ) . ' ' . get_option( 'time_format' ), $next_run ) ) : esc_html__( 'Not queued', 'member-search' ); ?></td>
+								<td><?php echo esc_html( ! empty( $saved_schedule['last_status'] ) ? ucwords( str_replace( '_', ' ', $saved_schedule['last_status'] ) ) : __( 'Not run yet', 'member-search' ) ); ?></td>
+								<td>
+									<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
+										<input type="hidden" name="action" value="cen_ear_delete_report_schedule">
+										<input type="hidden" name="schedule_id" value="<?php echo esc_attr( $saved_schedule_id ); ?>">
+										<?php wp_nonce_field( 'cen_ear_delete_report_schedule_' . $saved_schedule_id ); ?>
+										<button type="submit" class="button cen-ear-delete-schedule" onclick="return window.confirm(<?php echo esc_attr( wp_json_encode( __( 'Delete this automatic report?', 'member-search' ) ) ); ?>);"><?php echo esc_html__( 'Delete', 'member-search' ); ?></button>
+									</form>
+								</td>
+							</tr>
+						<?php endforeach; ?>
+						</tbody>
+					</table>
+				</details>
+			<?php endif; ?>
+
 			<?php if ( is_array( $search ) ) : ?>
+				<?php if ( $has_submitted_search ) : ?>
+				<details id="cen-ear-schedule-editor" class="cen-ear-schedule-editor">
+					<summary><?php echo esc_html__( 'Schedule this report', 'member-search' ); ?></summary>
+					<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" autocomplete="off" data-form-type="other">
+						<input type="hidden" name="action" value="cen_ear_add_report_schedule">
+						<?php if ( $include_suspended ) : ?><input type="hidden" name="include_suspended" value="1"><?php endif; ?>
+						<?php foreach ( $rules as $rule_index => $rule ) : ?>
+							<input type="hidden" name="criteria[<?php echo esc_attr( $rule_index ); ?>][attribute]" value="<?php echo esc_attr( $rule['attribute'] ); ?>">
+							<input type="hidden" name="criteria[<?php echo esc_attr( $rule_index ); ?>][operator]" value="<?php echo esc_attr( $rule['operator'] ); ?>">
+							<?php foreach ( $rule['values'] as $value ) : ?><input type="hidden" name="criteria[<?php echo esc_attr( $rule_index ); ?>][values][]" value="<?php echo esc_attr( $value ); ?>"><?php endforeach; ?>
+						<?php endforeach; ?>
+						<?php wp_nonce_field( 'cen_ear_add_report_schedule' ); ?>
+						<p><label><?php echo esc_html__( 'Report name', 'member-search' ); ?><br><input type="text" name="report_name" class="regular-text" value="" autocomplete="off" data-1p-ignore data-lpignore="true" data-bwignore="true" required></label></p>
+						<p><label><?php echo esc_html__( 'Email report to', 'member-search' ); ?><br><input type="email" name="report_email" class="regular-text" value="" autocomplete="off" data-1p-ignore data-lpignore="true" data-bwignore="true" data-form-type="other" multiple required></label><br><span class="description"><?php echo esc_html__( 'Separate multiple email addresses with commas.', 'member-search' ); ?></span></p>
+						<p><strong><?php echo esc_html__( 'Runs:', 'member-search' ); ?></strong> <?php echo esc_html__( 'At 11:59 PM on the final day of every month (in the timezone of the WordPress site).', 'member-search' ); ?></p>
+						<p><button type="submit" class="button button-primary"><?php echo esc_html__( 'Save Automatic Report', 'member-search' ); ?></button></p>
+					</form>
+				</details>
+				<?php endif; ?>
 				<div class="cen-ear-results-header">
 					<h2>
 						<?php
@@ -4115,9 +4384,11 @@ function cen_ear_get_excel_column_name( $index ) {
  * Build and stream the member-search Excel workbook.
  *
  * @param array $members           Matching member or attendee rows.
- * @param bool  $attendance_report Whether to render attendance-report columns.
+ * @param bool   $attendance_report Whether to render attendance-report columns.
+ * @param string $output_path       Optional server path instead of a browser download.
+ * @return bool|void True when a server-side file is written; otherwise exits after download.
  */
-function cen_ear_stream_member_workbook( $members, $attendance_report = false ) {
+function cen_ear_stream_member_workbook( $members, $attendance_report = false, $output_path = '' ) {
 	$spreadsheet = new \PhpOffice\PhpSpreadsheet\Spreadsheet();
 	$spreadsheet->getProperties()
 		->setCreator( 'CEN' )
@@ -4285,6 +4556,14 @@ function cen_ear_stream_member_workbook( $members, $attendance_report = false ) 
 		->setFitToHeight( 0 );
 	$sheet->getPageMargins()->setTop( 0.4 )->setRight( 0.4 )->setBottom( 0.4 )->setLeft( 0.4 );
 
+	$writer = new \PhpOffice\PhpSpreadsheet\Writer\Xlsx( $spreadsheet );
+	if ( '' !== $output_path ) {
+		$writer->save( $output_path );
+		$spreadsheet->disconnectWorksheets();
+
+		return true;
+	}
+
 	if ( headers_sent() ) {
 		$spreadsheet->disconnectWorksheets();
 		wp_die( esc_html__( 'The Excel file could not be sent because output had already started.', 'member-search' ) );
@@ -4295,7 +4574,6 @@ function cen_ear_stream_member_workbook( $members, $attendance_report = false ) 
 	header( 'Content-Disposition: attachment; filename="' . ( $attendance_report ? 'attendance-report-' : 'search-report-' ) . time() . '.xlsx"' );
 	header( 'Cache-Control: max-age=0' );
 
-	$writer = new \PhpOffice\PhpSpreadsheet\Writer\Xlsx( $spreadsheet );
 	$writer->save( 'php://output' );
 	$spreadsheet->disconnectWorksheets();
 	exit;
@@ -4380,6 +4658,128 @@ function cen_ear_export_members() {
 	}
 
 	cen_ear_stream_member_workbook( $members );
+}
+
+/**
+ * Run a saved report, email its Excel file, and queue the following month.
+ *
+ * @param string $schedule_id Schedule identifier.
+ */
+function cen_ear_run_scheduled_report( $schedule_id ) {
+	$schedules = cen_ear_get_report_schedules();
+	if ( empty( $schedules[ $schedule_id ] ) ) {
+		return;
+	}
+
+	$schedule   = $schedules[ $schedule_id ];
+	$attachment = '';
+	$status     = 'failed';
+	$message    = '';
+
+	try {
+		$attributes = cen_ear_get_search_attributes( cen_ear_get_event_choices() );
+		$rules      = cen_ear_validate_criteria_rules( isset( $schedule['rules'] ) ? $schedule['rules'] : array(), $attributes );
+		if ( is_wp_error( $rules ) ) {
+			throw new RuntimeException( $rules->get_error_message() );
+		}
+
+		$search = cen_ear_query_criteria_rules( $rules, $attributes, 0, ! empty( $schedule['include_suspended'] ) );
+		if ( is_wp_error( $search ) ) {
+			throw new RuntimeException( $search->get_error_message() );
+		}
+
+		$rows                 = array();
+		$attendance_report    = 1 === count( $rules ) && 'attendance_report' === $rules[0]['attribute'];
+		if ( $attendance_report ) {
+			$rows = cen_ear_get_attendance_report_rows( absint( $rules[0]['values'][0] ), ! empty( $schedule['include_suspended'] ) );
+			if ( is_wp_error( $rows ) ) {
+				throw new RuntimeException( $rows->get_error_message() );
+			}
+		} else {
+			$rows = array_merge(
+				cen_ear_get_member_report_rows( $search['ids'], true, cen_ear_get_criteria_event_ids( $rules, $attributes ) ),
+				isset( $search['guests'] ) ? $search['guests'] : array()
+			);
+		}
+
+		if ( empty( $rows ) ) {
+			$status  = 'no_matches';
+			$message = __( 'The automatic report ran successfully, but no records matched its saved criteria.', 'member-search' );
+		} else {
+			$loaded = cen_ear_load_phpspreadsheet_library(
+				array(
+					'PhpOffice\\PhpSpreadsheet\\Spreadsheet',
+					'PhpOffice\\PhpSpreadsheet\\Cell\\DataType',
+					'PhpOffice\\PhpSpreadsheet\\Style\\Alignment',
+					'PhpOffice\\PhpSpreadsheet\\Style\\Border',
+					'PhpOffice\\PhpSpreadsheet\\Style\\Fill',
+					'PhpOffice\\PhpSpreadsheet\\Shared\\Date',
+					'PhpOffice\\PhpSpreadsheet\\Worksheet\\PageSetup',
+					'PhpOffice\\PhpSpreadsheet\\Writer\\Xlsx',
+				)
+			);
+			if ( is_wp_error( $loaded ) ) {
+				throw new RuntimeException( $loaded->get_error_message() );
+			}
+
+			$temp_file = wp_tempnam( 'member-report.xlsx' );
+			if ( ! $temp_file ) {
+				throw new RuntimeException( __( 'WordPress could not create a temporary report file.', 'member-search' ) );
+			}
+			$report_file_name = sanitize_file_name(
+				( isset( $schedule['name'] ) ? $schedule['name'] : 'automatic-member-report' ) . '-' . wp_date( 'Y-m-d' ) . '-' . substr( md5( $schedule_id . microtime() ), 0, 8 ) . '.xlsx'
+			);
+			$attachment = trailingslashit( dirname( $temp_file ) ) . $report_file_name;
+			if ( ! @rename( $temp_file, $attachment ) ) { // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+				$attachment = $temp_file;
+			}
+			cen_ear_stream_member_workbook( $rows, $attendance_report, $attachment );
+			$status  = 'success';
+			$message = sprintf(
+				/* translators: %s: number of rows in the attached report. */
+				_n( 'The attached automatic report contains %s record.', 'The attached automatic report contains %s records.', count( $rows ), 'member-search' ),
+				number_format_i18n( count( $rows ) )
+			);
+		}
+	} catch ( Throwable $error ) {
+		$status  = 'failed';
+		$message = sprintf(
+			/* translators: %s: report error message. */
+			__( 'The automatic report could not be created: %s', 'member-search' ),
+			$error->getMessage()
+		);
+	}
+
+	$subject = sprintf(
+		/* translators: %s: saved report name. */
+		__( 'Scheduled report: %s', 'member-search' ),
+		isset( $schedule['name'] ) ? $schedule['name'] : __( 'Automatic Member Report', 'member-search' )
+	);
+	$recipients = cen_ear_get_report_recipient_emails( isset( $schedule['email'] ) ? $schedule['email'] : '' );
+	if ( empty( $recipients ) ) {
+		$recipients = array( get_option( 'admin_email' ) );
+	}
+	$sent = wp_mail(
+		$recipients,
+		$subject,
+		$message,
+		array(),
+		'' !== $attachment ? array( $attachment ) : array()
+	);
+	if ( ! $sent ) {
+		$status .= '_email_failed';
+	}
+	if ( '' !== $attachment && file_exists( $attachment ) ) {
+		wp_delete_file( $attachment );
+	}
+
+	$schedules = cen_ear_get_report_schedules();
+	if ( isset( $schedules[ $schedule_id ] ) ) {
+		$schedules[ $schedule_id ]['last_run']    = time();
+		$schedules[ $schedule_id ]['last_status'] = $status;
+		update_option( CEN_EAR_REPORT_SCHEDULES_OPTION, $schedules, false );
+		cen_ear_schedule_next_report_run( $schedule_id, time() );
+	}
 }
 
 /**
